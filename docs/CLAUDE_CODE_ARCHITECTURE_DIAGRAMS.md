@@ -393,6 +393,249 @@ flowchart LR
 
 ---
 
+## 11. Agentic Orchestration Stack
+
+```mermaid
+graph TB
+    subgraph History["HISTORY LAYER"]
+        HE["HistoryEntry"]
+        HE --> |"Links to"| CS["Claude Session"]
+        HE --> |"Contains"| Syn["Synopsis Summary"]
+    end
+
+    subgraph Batch["BATCH LAYER (Auto Run)"]
+        Doc["Document Loop"]
+        Task["Task Loop"]
+        Spawn["Agent Spawn"]
+        Doc --> Task --> Spawn
+        Spawn --> |"Synopsis"| History
+    end
+
+    subgraph Queue["QUEUE LAYER"]
+        EQ["Execution Queue"]
+        FIFO["FIFO Processing"]
+        Tab["Tab Dispatch"]
+        EQ --> FIFO --> Tab
+    end
+
+    subgraph Session["SESSION LAYER"]
+        PM["ProcessManager"]
+        Parse["Stream-JSON Parser"]
+        Origin["Session Origin Tracker"]
+        PM --> Parse --> Origin
+    end
+
+    Queue --> |"Spawn"| Batch
+    Batch --> |"Enqueue"| Queue
+    Session --> |"Events"| Queue
+```
+
+---
+
+## 12. Batch Processing State Machine
+
+```mermaid
+stateDiagram-v2
+    [*] --> Idle: Initialize
+
+    Idle --> Running: Start Batch
+    Running --> Stopping: Stop Requested
+    Stopping --> Idle: Task Complete
+
+    state Running {
+        [*] --> DocumentLoop
+
+        state DocumentLoop {
+            [*] --> ReadDoc
+            ReadDoc --> TaskLoop: Has tasks
+            ReadDoc --> NextDoc: No tasks
+
+            state TaskLoop {
+                [*] --> SpawnAgent
+                SpawnAgent --> WaitExit
+                WaitExit --> Synopsis
+                Synopsis --> AddHistory
+                AddHistory --> RereadDoc
+                RereadDoc --> SpawnAgent: More tasks
+                RereadDoc --> [*]: No tasks
+            }
+
+            TaskLoop --> ResetDoc: Reset enabled
+            ResetDoc --> NextDoc
+            TaskLoop --> NextDoc: No reset
+        }
+
+        NextDoc --> DocumentLoop: More docs
+        NextDoc --> LoopCheck: All docs done
+
+        LoopCheck --> DocumentLoop: Loop enabled
+        LoopCheck --> [*]: Loop disabled
+    }
+```
+
+---
+
+## 13. Synopsis Generation Flow
+
+```mermaid
+sequenceDiagram
+    participant Main as Main Session
+    participant BG as Background Process
+    participant Claude as Claude Code
+    participant History as History Store
+
+    Note over Main: Task completes
+    Main->>Main: Check saveToHistory flag
+
+    alt saveToHistory enabled
+        Main->>BG: spawnBackgroundSynopsis(claudeSessionId)
+
+        BG->>Claude: claude --resume <id> -- "synopsis prompt"
+        Claude-->>BG: **Summary:** ... **Details:** ...
+
+        BG->>BG: parseSynopsis(response)
+        BG-->>Main: { shortSummary, fullSynopsis }
+
+        Main->>History: addHistoryEntry({<br/>  type: 'USER',<br/>  summary,<br/>  claudeSessionId<br/>})
+    end
+```
+
+---
+
+## 14. Multi-Tab Parallel Execution
+
+```mermaid
+gantt
+    title Multi-Tab Execution Timeline
+    dateFormat X
+    axisFormat %s
+
+    section Tab 1 (Write)
+    Task A (Write Mode)    :active, t1a, 0, 20
+    Idle                   :t1b, 20, 40
+    Task D (Write Mode)    :active, t1d, 40, 60
+
+    section Tab 2 (Read)
+    Waiting                :t2a, 0, 5
+    Task B (Read-Only)     :active, t2b, 5, 15
+    Task E (Read-Only)     :active, t2e, 25, 35
+
+    section Tab 3 (Read)
+    Waiting                :t3a, 0, 8
+    Task C (Read-Only)     :active, t3c, 8, 18
+    Task F (Read-Only)     :active, t3f, 30, 45
+```
+
+---
+
+## 15. Session Origin Classification
+
+```mermaid
+flowchart LR
+    subgraph Sources["Session Sources"]
+        UI["User Types in Maestro"]
+        Batch["Auto Run / Batch"]
+        CLI["CLI Playbook"]
+    end
+
+    subgraph Registration["Origin Registration"]
+        RegUser["registerSessionOrigin(<br/>path, id, 'user')"]
+        RegAuto["registerSessionOrigin(<br/>path, id, 'auto')"]
+    end
+
+    subgraph Storage["Session Origins Store"]
+        Store["{ projectPath: {<br/>  sessionId: {<br/>    origin: 'user'|'auto',<br/>    sessionName?,<br/>    starred?<br/>  }<br/>}}"]
+    end
+
+    subgraph Usage["Benefits"]
+        Filter["UI Filtering"]
+        HistType["History Type"]
+        Naming["Session Naming"]
+        Star["Starring"]
+    end
+
+    UI --> RegUser
+    Batch --> RegAuto
+    CLI --> RegAuto
+
+    RegUser --> Store
+    RegAuto --> Store
+
+    Store --> Filter
+    Store --> HistType
+    Store --> Naming
+    Store --> Star
+```
+
+---
+
+## 16. Complete Agentic Flow
+
+```mermaid
+flowchart TB
+    subgraph User["User Action"]
+        Input["Send Message"]
+        StartBatch["Start Auto Run"]
+    end
+
+    subgraph Queue["Execution Queue"]
+        Check{Busy?}
+        Add["Add to Queue"]
+        Process["Process Item"]
+    end
+
+    subgraph Spawn["Process Spawn"]
+        BuildArgs["Build CLI Args"]
+        AddResume["Add --resume?"]
+        AddPlan["Add --permission-mode plan?"]
+        SpawnClaude["spawn('claude', args)"]
+    end
+
+    subgraph Parse["Output Processing"]
+        StreamJSON["Parse JSONL"]
+        EmitData["emit('data')"]
+        EmitSessionId["emit('session-id')"]
+        EmitUsage["emit('usage')"]
+    end
+
+    subgraph Complete["Completion"]
+        MarkIdle["Mark Tab Idle"]
+        CheckQueue{Queue Empty?}
+        Synopsis["Generate Synopsis?"]
+        AddHistory["Add History Entry"]
+        NextItem["Process Next"]
+    end
+
+    Input --> Check
+    StartBatch --> Check
+
+    Check -->|No| BuildArgs
+    Check -->|Yes| Add
+    Add -.-> Process
+
+    BuildArgs --> AddResume
+    AddResume --> AddPlan
+    AddPlan --> SpawnClaude
+
+    SpawnClaude --> StreamJSON
+    StreamJSON --> EmitData
+    StreamJSON --> EmitSessionId
+    StreamJSON --> EmitUsage
+
+    EmitData --> MarkIdle
+    MarkIdle --> CheckQueue
+
+    CheckQueue -->|No| NextItem
+    NextItem --> Process
+    Process --> BuildArgs
+
+    CheckQueue -->|Yes| Synopsis
+    Synopsis --> AddHistory
+    AddHistory --> Done((Done))
+```
+
+---
+
 ## Visual Legend
 
 | Symbol | Meaning |

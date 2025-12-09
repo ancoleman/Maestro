@@ -721,6 +721,465 @@ function validateProjectPath(path: string): boolean {
 
 ---
 
+## 11. Agentic Orchestration Patterns
+
+> **Critical Section**: These patterns enable autonomous, multi-step agent workflows beyond simple request-response.
+
+### 11.1 Execution Queue Pattern
+
+The execution queue enables sequential message processing with multi-tab support. Messages are queued when the agent is busy and processed FIFO on completion.
+
+#### Queue Item Structure
+
+```typescript
+interface QueuedItem {
+  id: string;                    // Unique item ID
+  timestamp: number;             // When queued (for ordering)
+  tabId: string;                 // Target tab for this item
+  type: 'message' | 'command';   // Item type
+
+  // For messages
+  text?: string;                 // Message text
+  images?: string[];             // Attached images (base64)
+
+  // For commands
+  command?: string;              // Slash command (e.g., '/commit')
+  commandDescription?: string;   // Display text
+
+  // Execution mode
+  readOnlyMode?: boolean;        // If true, use --permission-mode plan
+}
+```
+
+#### Processing Flow
+
+```typescript
+class ExecutionQueueProcessor {
+  private queue: QueuedItem[] = [];
+  private isProcessing = false;
+
+  enqueue(item: QueuedItem): void {
+    this.queue.push(item);
+    this.processNext();
+  }
+
+  private async processNext(): Promise<void> {
+    if (this.isProcessing || this.queue.length === 0) return;
+
+    this.isProcessing = true;
+    const item = this.queue.shift()!;
+
+    try {
+      // Build args with optional read-only mode
+      const args = [...BASE_ARGS];
+      if (item.readOnlyMode) {
+        args.push('--permission-mode', 'plan');
+      }
+
+      // Spawn and wait for completion
+      await this.spawnAgent(item.tabId, item.text || item.command, args);
+    } finally {
+      this.isProcessing = false;
+      // Process next item after completion
+      setTimeout(() => this.processNext(), 0);
+    }
+  }
+}
+```
+
+#### Key Behaviors
+
+| Scenario | Behavior |
+|----------|----------|
+| Agent idle | Execute immediately |
+| Agent busy | Add to queue |
+| Task completes | Pop next from queue |
+| Multiple tabs | Items carry target `tabId` |
+| Read-only items | Can execute in parallel across tabs |
+
+---
+
+### 11.2 Batch Processing / Auto Run Pattern
+
+Autonomous multi-document, multi-loop task execution with progress tracking.
+
+#### Batch Configuration
+
+```typescript
+interface BatchRunConfig {
+  documents: BatchDocumentEntry[];  // Ordered document list
+  prompt: string;                   // Template prompt with {{variables}}
+  loopEnabled: boolean;             // Repeat when all docs complete
+  maxLoops?: number | null;         // Limit iterations (null = infinite)
+  worktree?: WorktreeConfig;        // Optional Git worktree isolation
+}
+
+interface BatchDocumentEntry {
+  filename: string;          // Document filename
+  resetOnCompletion: boolean; // Uncheck tasks after completion (for loops)
+}
+
+interface BatchRunState {
+  isRunning: boolean;
+  isStopping: boolean;
+
+  // Document progress
+  documents: string[];
+  currentDocumentIndex: number;
+
+  // Task progress (within current document)
+  currentDocTasksTotal: number;
+  currentDocTasksCompleted: number;
+
+  // Overall progress
+  totalTasksAcrossAllDocs: number;
+  completedTasksAcrossAllDocs: number;
+
+  // Loop tracking
+  loopEnabled: boolean;
+  loopIteration: number;
+  maxLoops?: number | null;
+}
+```
+
+#### Execution Loop
+
+```typescript
+async function runBatch(config: BatchRunConfig): Promise<void> {
+  let loopIteration = 0;
+
+  while (true) {
+    let tasksCompletedThisLoop = 0;
+
+    // Document loop
+    for (const doc of config.documents) {
+      const { taskCount, content } = await readDocument(doc.filename);
+
+      // Task loop (process unchecked Markdown checkboxes: - [ ])
+      while (hasUncompletedTasks(content)) {
+        // Substitute template variables
+        const prompt = substituteVariables(config.prompt, {
+          '{{loopNumber}}': loopIteration + 1,
+          '{{documentName}}': doc.filename,
+          '{{taskNumber}}': currentTaskIndex + 1,
+        });
+
+        // Execute task
+        const result = await spawnAgent(prompt);
+        tasksCompletedThisLoop++;
+
+        // Generate synopsis for history
+        await spawnBackgroundSynopsis(result.claudeSessionId, SYNOPSIS_PROMPT);
+
+        // Register as auto-initiated
+        await registerSessionOrigin(result.claudeSessionId, 'auto');
+
+        // Add to history
+        addHistoryEntry({
+          type: 'AUTO',
+          summary: parsedSynopsis.shortSummary,
+          fullResponse: parsedSynopsis.fullSynopsis,
+          claudeSessionId: result.claudeSessionId,
+          usageStats: result.usageStats,
+        });
+
+        // Re-read document (tasks may be checked off)
+        content = await readDocument(doc.filename);
+      }
+
+      // Reset document for next loop if configured
+      if (doc.resetOnCompletion) {
+        await uncheckAllTasks(doc.filename);
+      }
+    }
+
+    // Loop continuation check
+    if (!config.loopEnabled) break;
+    if (tasksCompletedThisLoop === 0) break; // Prevent infinite loop
+    if (config.maxLoops && loopIteration >= config.maxLoops - 1) break;
+
+    loopIteration++;
+  }
+}
+```
+
+#### Template Variables
+
+| Variable | Description | Example |
+|----------|-------------|---------|
+| `{{loopNumber}}` | Current loop iteration (1-based) | `1`, `2`, `3` |
+| `{{documentName}}` | Current document filename | `tasks.md` |
+| `{{taskNumber}}` | Task index within document | `1`, `2`, `3` |
+| `{{projectName}}` | Project directory name | `my-project` |
+| `{{timestamp}}` | ISO timestamp | `2024-01-15T10:30:00Z` |
+
+---
+
+### 11.3 Synopsis / History Tracking Pattern
+
+Background agent summarization for work tracking without interrupting the main session.
+
+#### Synopsis Generation
+
+```typescript
+async function spawnBackgroundSynopsis(
+  claudeSessionId: string,
+  prompt: string
+): Promise<{ summary: string; details: string }> {
+  // Use unique ID to avoid interfering with main session
+  const targetSessionId = `${sessionId}-synopsis-${Date.now()}`;
+
+  // Resume the COMPLETED session to generate synopsis
+  const args = [
+    ...BASE_ARGS,
+    '--resume', claudeSessionId  // Resume the session that just completed
+  ];
+
+  const result = await spawn('claude', args, { prompt });
+  return parseSynopsis(result.text);
+}
+
+const SYNOPSIS_PROMPT = `
+Provide a brief synopsis of what was accomplished in this session.
+
+Format your response as:
+**Summary:** [1-2 sentences describing the key outcome]
+
+**Details:** [A paragraph with specifics about files changed, decisions made, etc.]
+`;
+```
+
+#### Synopsis Response Parser
+
+```typescript
+function parseSynopsis(response: string): { shortSummary: string; fullSynopsis: string } {
+  // Clean ANSI codes and box drawing
+  const clean = response
+    .replace(/\x1b\[[0-9;]*m/g, '')
+    .replace(/─+/g, '')
+    .replace(/[│┌┐└┘├┤┬┴┼]/g, '')
+    .trim();
+
+  // Extract structured sections
+  const summaryMatch = clean.match(/\*\*Summary:\*\*\s*(.+?)(?=\*\*Details:\*\*|$)/is);
+  const detailsMatch = clean.match(/\*\*Details:\*\*\s*(.+?)$/is);
+
+  const shortSummary = summaryMatch?.[1]?.trim() || clean.split('\n')[0] || 'Task completed';
+  const details = detailsMatch?.[1]?.trim() || '';
+
+  return {
+    shortSummary,
+    fullSynopsis: details ? `${shortSummary}\n\n${details}` : shortSummary
+  };
+}
+```
+
+#### History Entry Structure
+
+```typescript
+interface HistoryEntry {
+  id: string;
+  type: 'AUTO' | 'USER';          // AUTO = batch, USER = interactive
+  timestamp: number;
+  summary: string;                 // Short description
+  fullResponse?: string;           // Complete synopsis
+  claudeSessionId?: string;        // Link to Claude session
+  projectPath: string;             // For filtering
+  sessionId?: string;              // Maestro session ID
+  usageStats?: UsageStats;         // Tokens and cost
+  success?: boolean;               // Task outcome
+  elapsedTimeMs?: number;          // Duration
+  validated?: boolean;             // Human verification flag
+}
+```
+
+#### Synopsis Triggers
+
+| Trigger | Type | When |
+|---------|------|------|
+| Batch task completion | AUTO | After each Auto Run task |
+| Loop completion | AUTO | Summary of all loop tasks |
+| `/commit` command | USER | After commit workflow |
+| `saveToHistory` tab flag | USER | After any message in flagged tab |
+
+---
+
+### 11.4 Session Origin Tracking
+
+Distinguish between user-initiated and auto-initiated sessions to prevent cross-contamination.
+
+#### Origin Types
+
+| Origin | Description | Created By |
+|--------|-------------|------------|
+| `user` | Interactive session | User typing in Maestro |
+| `auto` | Automated session | Batch processor, CLI playbooks |
+
+#### Registration Pattern
+
+```typescript
+// Store structure
+interface SessionOrigins {
+  [projectPath: string]: {
+    [claudeSessionId: string]: SessionOriginInfo;
+  };
+}
+
+interface SessionOriginInfo {
+  origin: 'user' | 'auto';
+  sessionName?: string;    // User-defined name
+  starred?: boolean;       // Favorited
+}
+
+// Registration on session creation
+async function registerSessionOrigin(
+  projectPath: string,
+  claudeSessionId: string,
+  origin: 'user' | 'auto',
+  sessionName?: string
+): Promise<void> {
+  const origins = await loadOrigins();
+
+  if (!origins[projectPath]) {
+    origins[projectPath] = {};
+  }
+
+  origins[projectPath][claudeSessionId] = sessionName
+    ? { origin, sessionName }
+    : { origin };
+
+  await saveOrigins(origins);
+}
+
+// Usage in interactive flow
+onSessionId((claudeSessionId) => {
+  registerSessionOrigin(cwd, claudeSessionId, 'user');
+});
+
+// Usage in batch flow
+const result = await spawnAgent(prompt);
+registerSessionOrigin(cwd, result.claudeSessionId, 'auto');
+```
+
+#### Benefits
+
+1. **UI Filtering**: Show only user sessions in session browser
+2. **History Separation**: AUTO vs USER entries
+3. **Session Naming**: Only user sessions get custom names
+4. **Starring**: Favorite important sessions
+
+---
+
+### 11.5 Multi-Agent Coordination Pattern
+
+Coordinating multiple parallel agent executions across tabs.
+
+#### Write Mode vs Read-Only Mode
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                     WRITE MODE (Default)                        │
+│  • Only ONE tab can execute at a time                           │
+│  • Full file system access                                      │
+│  • Changes persisted to disk                                    │
+│  • Other tabs queue their messages                              │
+└─────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────┐
+│                   READ-ONLY MODE (Plan)                         │
+│  • Multiple tabs can execute SIMULTANEOUSLY                     │
+│  • Analysis and planning only                                   │
+│  • No file modifications                                        │
+│  • Uses: --permission-mode plan                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+#### Tab State Coordination
+
+```typescript
+interface AITab {
+  state: 'idle' | 'busy';
+  readOnlyMode?: boolean;
+}
+
+function canExecuteImmediately(session: Session, tab: AITab): boolean {
+  // Read-only tabs can always execute (parallel analysis)
+  if (tab.readOnlyMode) return true;
+
+  // Write-mode: check if any other tab is busy in write mode
+  const writeModeBusy = session.aiTabs.some(
+    t => t.id !== tab.id && t.state === 'busy' && !t.readOnlyMode
+  );
+
+  return !writeModeBusy;
+}
+
+function getSessionState(session: Session): 'idle' | 'busy' {
+  // Session is busy if ANY tab is busy
+  return session.aiTabs.some(t => t.state === 'busy') ? 'busy' : 'idle';
+}
+```
+
+#### Parallel Execution Example
+
+```
+Time →
+┌────────────────────────────────────────────────────────────────┐
+│ Tab 1 (Write)  │████████████████│                              │
+│ Tab 2 (Read)   │     │██████│        │██████│                  │
+│ Tab 3 (Read)   │          │██████████│                         │
+└────────────────────────────────────────────────────────────────┘
+                 ↑          ↑
+                 │          └─ Tab 2 & 3 execute in parallel
+                 └─ Tab 1 blocks other write-mode tabs
+```
+
+---
+
+### 11.6 Agentic Pattern Summary
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                        AGENTIC ORCHESTRATION STACK                          │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  ┌────────────────────────────────────────────────────────────────────────┐ │
+│  │                    HISTORY LAYER (Persistent)                          │ │
+│  │  • HistoryEntry records with synopsis summaries                        │ │
+│  │  • Links to Claude sessions for continuity                             │ │
+│  │  • AUTO vs USER type separation                                        │ │
+│  └────────────────────────────────────────────────────────────────────────┘ │
+│                                   ▲                                          │
+│                                   │ Synopsis                                 │
+│  ┌────────────────────────────────────────────────────────────────────────┐ │
+│  │                    BATCH LAYER (Auto Run)                              │ │
+│  │  • Document loop → Task loop → Agent spawn                             │ │
+│  │  • Template variable substitution                                      │ │
+│  │  • Loop mode with reset-on-completion                                  │ │
+│  │  • Progress broadcasting to web clients                                │ │
+│  └────────────────────────────────────────────────────────────────────────┘ │
+│                                   ▲                                          │
+│                                   │ Spawn                                    │
+│  ┌────────────────────────────────────────────────────────────────────────┐ │
+│  │                    QUEUE LAYER (Execution Queue)                       │ │
+│  │  • FIFO message/command processing                                     │ │
+│  │  • Tab-targeted dispatch                                               │ │
+│  │  • Read-only parallel execution                                        │ │
+│  └────────────────────────────────────────────────────────────────────────┘ │
+│                                   ▲                                          │
+│                                   │ Enqueue                                  │
+│  ┌────────────────────────────────────────────────────────────────────────┐ │
+│  │                    SESSION LAYER (Claude Code)                         │ │
+│  │  • Process spawning with --resume                                      │ │
+│  │  • Stream-JSON parsing                                                 │ │
+│  │  • Session origin tracking                                             │ │
+│  └────────────────────────────────────────────────────────────────────────┘ │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
 ## Appendix A: TypeScript Interfaces
 
 ```typescript
